@@ -1,4 +1,4 @@
-"""Purpose: Termux Android daemon entry point. Dependencies: local modules, httpx, Flask."""
+"""Purpose: Termux Android daemon entry point with WebSocket transport and package crash monitoring. Dependencies: websockets + local modules + Flask debug API."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from pathlib import Path
 
 from api.client import ServerClient
 from api.server import LocalApiServer
+from api.ws_client import WebSocketClient
 from core.command_handler import CommandHandler
 from core.crash_detector import CrashDetector
 from core.heartbeat import HeartbeatReporter
@@ -42,9 +43,8 @@ def default_config() -> dict:
         "server_url": "",
         "device_token": "",
         "device_id": "",
-        "poll_interval": 5,
-        "heartbeat_interval": 30,
         "server_timeout": 15,
+        "heartbeat_interval": 30,
         "boot_grace_sec": 10,
         "packages": [],
         "runtime": {"retry_history": {}, "last_rejoin": {}},
@@ -60,7 +60,6 @@ def load_config() -> dict:
         config = json.load(handle)
     config.setdefault("runtime", {"retry_history": {}, "last_rejoin": {}})
     config.setdefault("packages", [])
-    config.setdefault("poll_interval", 5)
     config.setdefault("heartbeat_interval", 30)
     config.setdefault("server_timeout", 15)
     return config
@@ -93,29 +92,17 @@ def run_local_api(config, stop_event):
 
 
 def run_daemon(config: dict, local_api: bool) -> None:
-    log = setup_logging(str(PROJECT_DIR / "logs"), logging.INFO)
-    logger = logging.getLogger("roblox-client")
     adapter = package_logger("-")
+    setup_logging(str(PROJECT_DIR / "logs"), logging.INFO)
     shell = Shell(use_su=True)
     scanner = PackageScanner(shell)
     monitor = ProcessMonitor(shell)
     killer = PackageKiller(shell, monitor)
     rejoiner = Rejoiner(shell, monitor, killer, config, lambda: save_config(config), CONFIG_LOCK)
-    client = ServerClient(config)
-    heartbeat = HeartbeatReporter(client, config, monitor, CONFIG_LOCK)
-    crash_detector = CrashDetector(shell, monitor)
     stop_event = threading.Event()
-
-    def on_signal(signum, frame):
-        adapter.info("Received signal %s; shutting down daemon", signum)
-        stop_event.set()
-
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGINT, on_signal)
 
     if not config.get("server_url") or not config.get("device_token") or config.get("needs_repair"):
         adapter.error("Device requires pairing. Run: python main.py --setup")
-        client.close()
         return
 
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -125,12 +112,10 @@ def run_daemon(config: dict, local_api: bool) -> None:
     except BlockingIOError:
         adapter.error("Another daemon instance is already running")
         lock_handle.close()
-        client.close()
         return
 
-    daemon_pid = os.getpid()
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(daemon_pid), encoding="utf-8")
+    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     secure_chmod(PID_FILE)
     secure_chmod(LOCK_FILE)
 
@@ -140,15 +125,14 @@ def run_daemon(config: dict, local_api: bool) -> None:
         adapter.warning("termux-wake-lock is unavailable; Android power management may throttle the daemon")
 
     if local_api:
-        api_thread = threading.Thread(target=run_local_api, args=(config, stop_event), daemon=True)
-        api_thread.start()
+        threading.Thread(target=run_local_api, args=(config, stop_event), daemon=True).start()
 
-    start_times: dict[str, float] = {item.get("package"): time.monotonic() for item in config.get("packages", []) if item.get("package")}
     try:
         startup_candidates = scanner.scan()
-        before = {item.get("package") for item in config.get("packages", [])}
-        config["packages"] = scanner.merge_manual(startup_candidates, config.get("packages", []))
-        save_config(config)
+        with CONFIG_LOCK:
+            before = {item.get("package") for item in config.get("packages", [])}
+            config["packages"] = scanner.merge_manual(startup_candidates, config.get("packages", []))
+            save_config(config)
         added = [item.package for item in startup_candidates if item.package not in before]
         if added:
             adapter.info("Startup scan detected new packages: %s", ", ".join(added))
@@ -156,12 +140,34 @@ def run_daemon(config: dict, local_api: bool) -> None:
         adapter.warning("Startup package scan failed; keeping existing configuration: %s", exc)
 
     adapter.info("Daemon started with %d configured packages", len(config.get("packages", [])))
+    heartbeat_reporter = HeartbeatReporter(config, monitor, CONFIG_LOCK)
+    command_handler = CommandHandler(config, lambda: save_config(config), scanner, monitor, killer, rejoiner, adapter, CONFIG_LOCK)
 
+    def on_auth_failure(_exc):
+        stop_event.set()
+
+    ws_client = WebSocketClient(
+        config,
+        command_handler,
+        heartbeat_reporter.payload,
+        lambda: save_config(config),
+        stop_event,
+        on_auth_failure=on_auth_failure,
+        logger=logging.getLogger("ws-client"),
+        config_lock=CONFIG_LOCK,
+    )
+    ws_client.start()
+
+    def on_signal(signum, frame):
+        adapter.info("Received signal %s; shutting down daemon", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    crash_detector = CrashDetector(shell, monitor)
+    start_times: dict[str, float] = {item.get("package"): time.monotonic() for item in config.get("packages", []) if item.get("package")}
     try:
-        command_handler = CommandHandler(client, config, lambda: save_config(config), scanner, monitor, killer, rejoiner, adapter, CONFIG_LOCK)
-        command_thread = threading.Thread(target=command_handler.run_forever, args=(heartbeat, stop_event), daemon=True)
-        command_thread.start()
-
         while not stop_event.is_set():
             try:
                 crash_detector.refresh()
@@ -173,10 +179,7 @@ def run_daemon(config: dict, local_api: bool) -> None:
                 if not item.get("enabled", False):
                     continue
                 pkg = str(item.get("package", ""))
-                if not pkg:
-                    continue
-                if not valid_package_name(pkg):
-                    package_logger(pkg).error("Invalid package name in config; skipping")
+                if not pkg or not valid_package_name(pkg):
                     continue
                 package_log = package_logger(pkg)
                 start_times.setdefault(pkg, time.monotonic())
@@ -188,21 +191,19 @@ def run_daemon(config: dict, local_api: bool) -> None:
                     evidence = crash_detector.detect(pkg, snapshot, was_expected_running=True)
                     if evidence.confirmed:
                         package_log.warning("Crash confirmed: %s | %s", evidence.reason, ", ".join(evidence.indicators))
-                        client.event("crash_detected", {"package": pkg, "reason": evidence.reason, "indicators": evidence.indicators})
+                        ws_client.send_event_threadsafe("crash_detected", {"package": pkg, "reason": evidence.reason, "indicators": evidence.indicators})
                         result = rejoiner.rejoin(item, reason=evidence.reason)
                         if result.get("ok"):
                             start_times[pkg] = time.monotonic()
-                            client.event("rejoin_success", {"package": pkg, "result": result, "automatic": True})
-                        elif result.get("retry_exhausted"):
-                            client.event("rejoin_failed", {"package": pkg, "result": result, "automatic": True})
-                        elif result.get("critical"):
-                            client.event("rejoin_failed", {"package": pkg, "result": result, "automatic": True})
+                            ws_client.send_event_threadsafe("rejoin_success", {"package": pkg, "result": result, "automatic": True})
+                        elif result.get("retry_exhausted") or result.get("critical"):
+                            ws_client.send_event_threadsafe("rejoin_failed", {"package": pkg, "result": result, "automatic": True})
                 except Exception as exc:
                     package_log.exception("Monitor cycle failed: %s", exc)
             stop_event.wait(3)
     finally:
         stop_event.set()
-        client.close()
+        ws_client.stop()
         PID_FILE.unlink(missing_ok=True)
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
@@ -217,7 +218,6 @@ def main() -> None:
     parser.add_argument("--daemon", action="store_true")
     parser.add_argument("--local-api", action="store_true")
     args = parser.parse_args()
-
     config = load_config()
     if args.setup or (not args.daemon and (not config.get("server_url") or not config.get("device_token"))):
         SetupMenu(PROJECT_DIR, config, lambda: save_config(config)).run()

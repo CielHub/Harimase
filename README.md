@@ -1,214 +1,56 @@
-# Roblox Auto-Rejoin + Discord Universal Control Bot — Sisi A
+# Sisi A — Roblox Auto-Rejoin Termux (WebSocket)
 
-Client ini berjalan di Android 10 + Termux + root/Magisk. Client melakukan polling ke Sisi B, memonitor package secara independen, dan hanya boleh menghentikan package target yang sudah diverifikasi.
+Transport utama ke Sisi B sekarang **WebSocket**: `ws://host:port/ws` untuk deployment NuraHost tanpa TLS. `/pair/claim` dan `/health` tetap HTTP.
 
-## Struktur
-
-```text
-termux-client/
-├── main.py
-├── config.json                  # dibuat saat setup, chmod 600
-├── config.example.json
-├── requirements.txt
-├── api/
-│   ├── server.py                # local debug API opsional
-│   └── client.py                # remote HTTP client
-├── core/
-│   ├── package_scanner.py
-│   ├── process_monitor.py
-│   ├── crash_detector.py
-│   ├── killer.py
-│   ├── rejoiner.py
-│   ├── heartbeat.py
-│   └── command_handler.py
-├── utils/
-│   ├── logger.py
-│   ├── shell.py
-│   └── crypto.py
-├── menus/setup_menu.py
-├── logs/
-└── scripts/boot.sh
-```
-
-## Instalasi dari HP kosong
-
-1. Install Termux dan Termux:Boot.
-2. Pastikan Magisk root aktif dan `su -c id` menghasilkan `uid=0`.
-3. Salin folder `termux-client` ke penyimpanan Termux.
-4. Dari root project jalankan:
+## Instalasi
 
 ```bash
 bash setup-termux.sh
 ```
 
-Atau langsung dari folder client:
+atau:
 
 ```bash
-python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python main.py --setup
 ```
 
 ## Pairing
 
-Di Discord jalankan:
+1. Jalankan `/pair generate` di Discord.
+2. Termux → `[1] Pairing device`.
+3. Masukkan `http://nano-1.nura.host:5127` saat diminta.
+4. Masukkan token 8 karakter.
+5. `device_token` + `device_id` disimpan di `config.json` permission `0600`.
+6. Jalankan daemon dengan `[7]` atau `python main.py --daemon`.
+7. Client otomatis membuat koneksi `ws://nano-1.nura.host:5127/ws`.
 
-```text
-/pair generate
-```
+## Test koneksi
 
-Token berlaku 5 menit dan hanya bisa dipakai sekali. Di Termux:
+Menu `[5] Test koneksi ke server` sekarang melakukan WS connect, autentikasi handshake, hello/ready, lalu probe ping/pong.
 
-```text
-[1] Pairing device
-```
+## Reconnect
 
-Isi server URL saat pertama kali diminta dan masukkan pairing token. Server mengembalikan `device_token` dan `device_id`. Token raw ditulis ke `config.json` dengan permission `0600`.
+`5s → 10s → 30s → 60s → 120s → 300s`. Server restart atau 4G drop akan memicu reconnect otomatis. Setelah connect, client kirim hello + ready lagi dan server mengirim queued command.
 
-### Kenapa claim tidak memakai device token?
+## Ping / heartbeat
 
-Karena `device_token` belum ada sebelum `/pair/claim` berhasil. Endpoint claim memakai pairing token sebagai credential sementara + HMAC key. Setelah pairing, semua request normal menggunakan device token. Signature mencakup timestamp dan nonce agar request yang tertangkap tidak dapat direplay dengan mengganti header tanpa membuat signature baru.
+Server mengirim application ping tiap 30 detik. Client membalas pong. Kalau dua ping berturut tidak mendapat pong dalam 5 detik, server menutup koneksi. Client akan reconnect. Heartbeat device dikirim setiap 30 detik melalui frame `heartbeat`. Kalau server ping tidak terdengar 60 detik, client memutus koneksi dan reconnect.
 
-## Auto-discovery
+## Command
 
-Scanner menjalankan tiga sumber informasi lalu mendeduplikasi hasil:
-
-1. `pm list packages -3`
-2. Heuristik data directory, metadata package/activity, keyword executor/Roblox, dan overlay permission
-3. Package yang ditambahkan manual melalui setup menu
-
-Package yang ditemukan otomatis ditandai `status=detected` dan `enabled=false`, sehingga tidak langsung aktif tanpa konfigurasi.
-
-Client juga menjalankan scan pada setiap startup. Dengan begitu package baru tetap bisa muncul setelah aplikasi Roblox/executor berubah package name.
-
-## Monitoring crash
-
-Setiap siklus monitor melakukan:
-
-- `pidof <pkg>`
-- verifikasi `/proc/<pid>/cmdline`
-- verifikasi `/proc/<pid>/status` UID
-- `dumpsys package <pkg>` untuk target UID
-- `dumpsys activity processes` untuk state
-- `logcat -b crash -d` dan logcat umum untuk crash/ANR baru
-- pemeriksaan log internal package bila tersedia
-
-PID terakhir yang berhasil diverifikasi disimpan agar ketika PID hilang, keputusan tidak bergantung pada `/proc/<pid>` yang sudah lenyap.
-
-**Tidak ada `pkill`, `killall`, pattern kill, atau `kill -9` tanpa verifikasi.** Urutan stop adalah:
-
-```text
-am force-stop <pkg>
-↓
-verifikasi target masih hidup
-↓
-kill -9 <PID> hanya bila cmdline + UID + process start-time masih cocok
-```
-
-## Rejoin
-
-Mode `deep_link` menjalankan:
-
-```text
-am start -W -a android.intent.action.VIEW -d 'roblox://experiences/start?placeId=...&gameInstanceId=...'
-```
-
-Mode `executor_only` menyelesaikan launchable activity package executor dan membuka activity tersebut tanpa membuat deep link Roblox.
-
-Per package:
-
-- cooldown default 25 detik
-- maksimal 5 retry per 30 menit
-- retry dihitung saat attempt mulai, termasuk attempt yang gagal
-- bila batas tercapai, event `rejoin_failed` dikirim ke Sisi B
-
-## Polling dan backoff
-
-Request memakai `X-Timestamp` + `X-Nonce` + HMAC signature. Polling command memakai satu command per request dengan lease server 120 detik, sehingga command tidak dieksekusi dua kali hanya karena polling cepat atau dua proses daemon yang tidak sengaja aktif. File lock daemon mencegah dua instance client berjalan bersamaan.
-
-Command dipoll setiap 5 detik. Heartbeat dikirim setiap 30 detik.
-
-Ketika Sisi B tidak dapat dihubungi, client memakai backoff:
-
-```text
-5s → 10s → 30s → 60s → 120s → 300s
-```
-
-401 membuat client menandai `needs_repair` dan menulis instruksi re-pair ke log. Setelah token direvoke di Discord, pairing ulang dilakukan melalui setup menu.
-
-## Menu
-
-```text
-=== Roblox Auto-Rejoin Setup ===
-[1] Pairing device
-[2] Scan package otomatis
-[3] Tambah package manual
-[4] Edit config package
-[5] Test koneksi ke server
-[6] Lihat status semua package
-[7] Start daemon di background
-[8] Stop daemon
-[9] Keluar
-```
-
-## Auto-start setelah reboot
-
-`setup-termux.sh` membuat:
-
-```text
-~/.termux/boot/roblox-auto-rejoin.sh
-```
-
-Script memanggil `termux-wake-lock` dan menjalankan daemon dari virtual environment project bila tersedia.
-
-## Logging
-
-Format:
-
-```text
-[YYYY-MM-DD HH:MM:SS] [LEVEL] [pkg] message
-```
-
-File utama:
-
-```text
-logs/client.log
-```
-
-Rotasi pada 5 MB, menyimpan 5 arsip gzip.
-
-## Konfigurasi package
-
-Contoh:
+Server mengirim:
 
 ```json
 {
-  "package": "com.delta.lite",
-  "alias": "Delta Lite",
-  "enabled": true,
-  "status": "active",
-  "place_id": "1234567890",
-  "job_id": "abcdef-1234-...",
-  "mode": "deep_link",
-  "cooldown_sec": 25,
-  "max_retry_per_30min": 5,
-  "detect_methods": ["pid", "logcat_crash", "dumpsys"]
+  "type": "command",
+  "id": "cmd_xxx",
+  "payload": {"action": "rejoin", "package": "com.example.roblox"}
 }
 ```
 
-## Local debug API opsional
+`CommandHandler` tetap memakai action lama: `rejoin`, `start`, `stop`, `scan`, `log`, `ping`, `package_config`. ACK dikirim dalam frame `ack`. ID command disimpan di LRU cache maksimum 1000 entry agar reconnect/retry tidak mengeksekusi command yang sama dua kali.
 
-Jalankan:
+## HTTP vs WS
 
-```bash
-.venv/bin/python main.py --daemon --local-api
-```
-
-Lalu dari device buka:
-
-```text
-http://127.0.0.1:8787/health
-http://127.0.0.1:8787/status
-```
-
-API lokal sengaja hanya bind ke localhost.
+HTTP diterima untuk `/pair/claim` dan `/health`. WS memakai skema yang sesuai dengan server: `http://` → `ws://`, `https://` → `wss://`. Untuk NuraHost port allocation plaintext, gunakan `http://...` di config sehingga client memakai `ws://.../ws`. HMAC, Authorization, timestamp, dan nonce tetap dipakai pada handshake. Plain HTTP/WS tidak mengenkripsi traffic.
