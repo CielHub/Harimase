@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from api.client import ServerClient, ServerUnavailable, AuthRequired
+from api.ws_client import WebSocketClient
 from core.package_scanner import PackageScanner, valid_package_name
 from core.process_monitor import ProcessMonitor
 from utils.shell import Shell
@@ -64,10 +65,7 @@ class SetupMenu:
             uuid = str(uuid_module.uuid4())
             self.config["device_uuid"] = uuid
         client = ServerClient(self.config)
-        try:
-            result = client.claim_pair(token, self.config.get("device_name", "Android Device"), uuid)
-        finally:
-            client.close()
+        result = client.claim_pair(token, self.config.get("device_name", "Android Device"), uuid)
         self.config["device_token"] = result["device_token"]
         self.config["device_id"] = result["device_id"]
         self.config.pop("needs_repair", None)
@@ -142,12 +140,15 @@ class SetupMenu:
         self.save_config()
         print("Config package diperbarui.")
 
-    def test_connection(self) -> None:
-        client = ServerClient(self.config)
+    def test_connection(self):
+        if not self.config.get("server_url") or not self.config.get("device_token") or not self.config.get("device_id"):
+            print("ERROR: device belum paired. Pilih [1] dulu.")
+            return
         try:
-            print(json.dumps(client.health(), indent=2))
-        finally:
-            client.close()
+            result = WebSocketClient.test_connection_sync(self.config)
+            print(f"OK: WebSocket connected. ping/pong={result.get('ping_pong')}")
+        except Exception as exc:
+            print(f"ERROR: WebSocket test failed: {exc}")
 
     def status(self) -> None:
         packages = self.config.get("packages", [])
