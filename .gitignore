@@ -1,0 +1,6 @@
+config.json
+logs/*
+!logs/.gitkeep
+__pycache__/
+*.pyc
+.venv/
