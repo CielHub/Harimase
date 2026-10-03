@@ -1,0 +1,16 @@
+{
+  "device_name": "HP-Android10-01",
+  "device_uuid": "",
+  "server_url": "https://bot.example.com",
+  "device_token": "",
+  "device_id": "",
+  "poll_interval": 5,
+  "heartbeat_interval": 30,
+  "server_timeout": 15,
+  "boot_grace_sec": 10,
+  "packages": [],
+  "runtime": {
+    "retry_history": {},
+    "last_rejoin": {}
+  }
+}
