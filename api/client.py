@@ -1,23 +1,25 @@
-"""Purpose: authenticated HTTP client with bounded retries and request replay protection. Dependencies: httpx."""
+"""Purpose: small HTTP client used only for /pair/claim and /health; WebSocket traffic lives in ws_client.py. Dependencies: standard library."""
 
 from __future__ import annotations
 
 import json
+import secrets
+import ssl
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-import httpx
-
-from utils.crypto import build_headers, sign_request
+from utils.crypto import sign_request
 
 
 class AuthRequired(RuntimeError):
-    """Raised when the server rejects the device credentials."""
+    """Raised when server credentials are rejected."""
 
 
 class ServerUnavailable(RuntimeError):
-    """Raised for transport and server-side availability failures."""
+    """Raised for network or server availability failures."""
 
 
 @dataclass(slots=True)
@@ -26,117 +28,92 @@ class ApiResponse:
     data: dict
 
 
+def validate_server_url(value: str) -> tuple[str, bool]:
+    normalized = str(value).strip().rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("server_url must be a valid http:// or https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("server_url must not contain username or password")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("server_url must be a base URL without path, query, or fragment")
+    hostname = parsed.hostname
+    if not hostname or any(ord(char) < 32 or char.isspace() for char in hostname) or len(hostname) > 253:
+        raise ValueError("server_url host is invalid")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("server_url must use a numeric port") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("server_url port must be between 1 and 65535")
+    if parsed.scheme == "http":
+        print("[WARN] Plain HTTP aktif. HMAC + token tetap melindungi request, tapi traffic tidak terenkripsi.")
+    return normalized, parsed.scheme == "http"
+
+
 class ServerClient:
     BACKOFF = (5, 10, 30, 60, 120, 300)
 
     def __init__(self, config) -> None:
         self.config = config
-        self.base_url = str(config.get("server_url", "")).rstrip("/")
+        self.base_url, self.insecure_transport = validate_server_url(config.get("server_url", ""))
         self.token = str(config.get("device_token", ""))
         self.device_id = str(config.get("device_id", ""))
-        self.timeout = max(3.0, min(float(config.get("server_timeout", 15)), 60.0))
-        parsed = urlparse(self.base_url)
-        if parsed.scheme not in {"https", "http"} or not parsed.netloc:
-            raise ValueError("server_url must be a valid http:// or https:// URL")
-        if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-            raise ValueError("server_url must use HTTPS unless it points to localhost")
-        self.http = httpx.Client(timeout=self.timeout, follow_redirects=False)
+        self.timeout = max(3, min(int(config.get("server_timeout", 15)), 60))
 
-    def close(self) -> None:
-        self.http.close()
+    def _request(self, method: str, path: str, body: bytes = b"") -> ApiResponse:
+        timestamp = int(time.time())
+        nonce = secrets.token_hex(16)
+        token_for_signing = self.token
+        if not token_for_signing:
+            raise AuthRequired("device is not paired")
+        headers = {
+            "Authorization": f"Bearer {token_for_signing}",
+            "X-Timestamp": str(timestamp),
+            "X-Nonce": nonce,
+            "X-Signature": sign_request(body, token_for_signing, timestamp, nonce),
+        }
+        if self.device_id:
+            headers["X-Device-Id"] = self.device_id
+        if body:
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(f"{self.base_url}{path}", data=body or None, headers=headers, method=method)
+        context = ssl.create_default_context() if self.base_url.startswith("https://") else None
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=context) as response:
+                raw = response.read()
+                payload = json.loads(raw.decode("utf-8")) if raw else {}
+                return ApiResponse(response.status, payload if isinstance(payload, dict) else {})
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")[:1000]
+            if exc.code == 401:
+                raise AuthRequired(body_text) from exc
+            if exc.code in {409, 429} or exc.code >= 500:
+                raise ServerUnavailable(f"HTTP {exc.code}: {body_text}") from exc
+            raise RuntimeError(body_text) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ServerUnavailable(str(exc)) from exc
 
     def health(self) -> dict:
         try:
-            response = self.http.get(f"{self.base_url}/health")
-        except httpx.HTTPError as exc:
+            request = urllib.request.Request(f"{self.base_url}/health", method="GET")
+            context = ssl.create_default_context() if self.base_url.startswith("https://") else None
+            with urllib.request.urlopen(request, timeout=self.timeout, context=context) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict) or payload.get("ok") is not True:
+                raise ServerUnavailable("invalid health response")
+            return payload
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ServerUnavailable(str(exc)) from exc
-        if response.is_redirect or response.is_error:
-            raise ServerUnavailable(f"health returned HTTP {response.status_code}")
-        data = response.json()
-        if not isinstance(data, dict) or data.get("ok") is not True:
-            raise ServerUnavailable("invalid health response")
-        return data
 
     def claim_pair(self, pairing_token: str, device_name: str, device_uuid: str) -> dict:
         body = json.dumps(
-            {"pairing_token": pairing_token, "device_name": device_name[:80], "device_uuid": device_uuid[:128]},
+            {"pairing_token": pairing_token.strip().upper(), "device_name": device_name[:80], "device_uuid": device_uuid[:128]},
             separators=(",", ":"),
         ).encode()
-        timestamp = int(time.time())
-        nonce = __import__("secrets").token_hex(16)
-        headers = {
-            "Authorization": f"Bearer {pairing_token}",
-            "X-Signature": sign_request(body, pairing_token, timestamp, nonce),
-            "X-Timestamp": str(timestamp),
-            "X-Nonce": nonce,
-            "X-Device-Id": device_uuid,
-            "Content-Type": "application/json",
-        }
-        try:
-            response = self.http.post(f"{self.base_url}/pair/claim", content=body, headers=headers)
-        except httpx.HTTPError as exc:
-            raise ServerUnavailable(str(exc)) from exc
-        if response.status_code in (401, 409):
-            raise AuthRequired(response.text[:1000])
-        if response.status_code >= 500:
-            raise ServerUnavailable(f"pairing server error HTTP {response.status_code}")
-        if response.status_code >= 400:
-            raise RuntimeError(response.text[:1000])
-        data = response.json()
-        if not isinstance(data, dict) or not data.get("device_token") or not data.get("device_id"):
+        self.token = pairing_token.strip().upper()
+        response = self._request("POST", "/pair/claim", body)
+        data = response.data
+        if not data.get("device_token") or not data.get("device_id"):
             raise RuntimeError("server returned an invalid pairing response")
         return data
-
-    def _request(self, method: str, path: str, body: bytes = b"", params: dict | None = None) -> ApiResponse:
-        if not self.base_url or not self.token or not self.device_id:
-            raise AuthRequired("device is not paired")
-        headers = build_headers(body, self.token, self.device_id)
-        if body:
-            headers["Content-Type"] = "application/json"
-        try:
-            response = self.http.request(
-                method,
-                f"{self.base_url}{path}",
-                content=body or None,
-                params=params,
-                headers=headers,
-            )
-        except httpx.HTTPError as exc:
-            raise ServerUnavailable(str(exc)) from exc
-        if response.is_redirect:
-            raise ServerUnavailable(f"unexpected redirect HTTP {response.status_code}")
-        if response.status_code == 401:
-            raise AuthRequired(response.text[:1000])
-        if response.status_code == 409:
-            raise RuntimeError(f"request rejected as replay/conflict: {response.text[:1000]}")
-        if response.status_code == 429 or response.status_code >= 500:
-            raise ServerUnavailable(f"HTTP {response.status_code}: {response.text[:1000]}")
-        if response.status_code >= 400:
-            raise RuntimeError(response.text[:1000])
-        data = response.json() if response.content else {}
-        if not isinstance(data, dict):
-            raise RuntimeError("server returned a non-object JSON response")
-        return ApiResponse(response.status_code, data)
-
-    def get(self, path: str, params: dict | None = None) -> dict:
-        return self._request("GET", path, b"", params).data
-
-    def post_json(self, path: str, payload: dict) -> dict:
-        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode()
-        return self._request("POST", path, body).data
-
-    def poll_commands(self, limit: int = 1) -> list[dict]:
-        data = self.get("/commands", {"device_id": self.device_id, "limit": str(max(1, min(limit, 1)))})
-        commands = data.get("commands", [])
-        if not isinstance(commands, list):
-            raise RuntimeError("invalid commands response")
-        return commands
-
-    def ack(self, command_id: str, status: str, result: str) -> dict:
-        return self.post_json("/commands/ack", {"command_id": command_id, "status": status, "result": result})
-
-    def event(self, event_type: str, payload: dict) -> dict:
-        return self.post_json("/event", {"type": event_type, "payload": payload})
-
-    def log(self, level: str, message: str, pkg: str = "") -> dict:
-        return self.post_json("/log", {"level": level, "message": message, "pkg": pkg, "ts": time.time()})
