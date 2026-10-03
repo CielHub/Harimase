@@ -1,4 +1,4 @@
-"""Purpose: HMAC request signing and secure config permissions. Dependencies: Python standard library."""
+"""Purpose: HMAC signing for HTTP pairing and WebSocket handshake plus secure config permissions. Dependencies: Python standard library."""
 
 from __future__ import annotations
 
