@@ -41,3 +41,4 @@ class LocalApiServer:
 def create_local_app(get_status):
     """Compatibility factory returning the Flask application used by LocalApiServer."""
     return LocalApiServer(get_status).app
+
