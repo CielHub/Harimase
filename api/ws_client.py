@@ -29,7 +29,7 @@ OUTBOUND_QUEUE_MAX = 200
 class WebSocketClient:
     VERSION = "1.0.0"
 
-    def __init__(self, config: dict, command_handler, heartbeat_builder: Callable[[], dict], save_config, stop_event: threading.Event, on_auth_failure=None, logger=None, config_lock=None, on_state_change=None):
+    def __init__(self, config: dict, command_handler, heartbeat_builder: Callable[[], dict], save_config, stop_event: threading.Event, on_auth_failure=None, logger=None, config_lock=None, on_state_change=None, on_session_ready: Callable[[], dict | None] | None = None):
         self.config = config
         self.command_handler = command_handler
         self.heartbeat_builder = heartbeat_builder
@@ -39,6 +39,7 @@ class WebSocketClient:
         self.logger = logger or logging.getLogger("ws-client")
         self.config_lock = config_lock
         self.on_state_change = on_state_change
+        self.on_session_ready = on_session_ready
         self._reconnect_count = 0
         self.base_url, self.insecure_transport = validate_server_url(config.get("server_url", ""))
         self.ws_url = self._to_ws_url(self.base_url)
@@ -123,8 +124,13 @@ class WebSocketClient:
         while not self.stop_event.is_set():
             self._set_state("CONNECTING")
             try:
-                await self._connect_once()
-                backoff_index = 0
+                connected = await self._connect_once()
+                if connected and not self.stop_event.is_set():
+                    backoff_index = 0
+                    self._reconnect_count = 0
+                    delay = RECONNECT_BACKOFF[0]
+                    self._set_state("RECONNECTING", f"Reconnect in {delay}s after clean disconnect")
+                    await self._sleep_interruptible(delay)
             except AuthRequired as exc:
                 self._set_state("AUTH_FAILED", f"Authentication rejected: {exc}")
                 self.logger.error("Authentication rejected. Run setup pairing again: %s", exc)
@@ -143,8 +149,12 @@ class WebSocketClient:
                 backoff_index = min(backoff_index + 1, len(RECONNECT_BACKOFF) - 1)
                 await self._sleep_interruptible(delay)
             except Exception as exc:
+                delay = RECONNECT_BACKOFF[min(backoff_index, len(RECONNECT_BACKOFF) - 1)]
+                self._reconnect_count += 1
+                self._set_state("RECONNECTING", f"Unexpected transport failure; reconnect in {delay}s")
                 self.logger.exception("Unexpected WebSocket loop failure: %s", exc)
-                await asyncio.sleep(30)
+                backoff_index = min(backoff_index + 1, len(RECONNECT_BACKOFF) - 1)
+                await self._sleep_interruptible(delay)
 
     async def _sleep_interruptible(self, seconds: int) -> None:
         deadline = time.monotonic() + max(0, seconds)
@@ -188,10 +198,13 @@ class WebSocketClient:
             self._handle_server_hello(json.loads(hello))
             await self._send({"type": "hello", "payload": self._hello_payload()})
             await self._send({"type": "ready", "payload": {}})
-            self._set_state("CONNECTED", "WebSocket ready")
-            await self._flush_outbound()
+            self._set_state("READY", "WebSocket ready")
             heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="ws-heartbeat")
             ping_watchdog = asyncio.create_task(self._ping_watchdog(), name="ws-ping-watchdog")
+            package_scan_task = None
+            if self.on_session_ready is not None:
+                package_scan_task = asyncio.create_task(self._auto_scan_and_sync(), name="ws-package-auto-scan")
+            await self._flush_outbound()
             try:
                 async for raw in ws:
                     self._last_ping = self._last_ping if self._last_ping else time.monotonic()
@@ -199,15 +212,33 @@ class WebSocketClient:
             finally:
                 heartbeat_task.cancel()
                 ping_watchdog.cancel()
-                for task in (heartbeat_task, ping_watchdog):
+                if package_scan_task is not None:
+                    package_scan_task.cancel()
+                for task in (heartbeat_task, ping_watchdog, package_scan_task):
+                    if task is None:
+                        continue
                     try:
                         await task
                     except asyncio.CancelledError:
                         pass
                 self._ws = None
                 self._send_lock = None
-        if not self.stop_event.is_set():
-            raise ServerUnavailable("WebSocket connection closed")
+        if self.stop_event.is_set():
+            return False
+        return True
+
+    async def _auto_scan_and_sync(self) -> None:
+        try:
+            inventory = await asyncio.to_thread(self.on_session_ready)
+            if inventory:
+                await self._send_or_queue({
+                    "type": "event",
+                    "payload": {"event": "package_inventory", **inventory},
+                })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.exception("Automatic package scan/sync failed: %s", exc)
 
     def _handle_server_hello(self, message: dict) -> None:
         if not isinstance(message, dict) or message.get("type") != "hello":
