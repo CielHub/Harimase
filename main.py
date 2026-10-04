@@ -24,6 +24,7 @@ from core.killer import PackageKiller
 from core.package_scanner import PackageScanner, valid_package_name
 from core.process_monitor import ProcessMonitor
 from core.rejoiner import Rejoiner
+from menus.main_menu import MainMenu
 from menus.setup_menu import SetupMenu
 from tui.dashboard import Dashboard, tui_supported
 from utils.crypto import secure_chmod
@@ -219,28 +220,11 @@ def run_daemon(config: dict, local_api: bool, tui: bool | None = None) -> None:
     def reconnect_now() -> None:
         ws_client.request_reconnect()
 
-    def stop_enabled_packages() -> None:
-        with CONFIG_LOCK:
-            enabled_packages = [dict(item) for item in config.get("packages", []) if isinstance(item, dict) and item.get("enabled")]
-            for item in config.get("packages", []):
-                if isinstance(item, dict) and item.get("enabled"):
-                    item["enabled"] = False
-                    item["status"] = "stopped"
-            if enabled_packages:
-                save_config(config)
-        for item in enabled_packages:
-            pkg = str(item.get("package", ""))
-            if not pkg:
-                continue
-            try:
-                killer.stop(pkg, cached=monitor.cached_processes(pkg))
-                state.set_package(pkg, state="STOPPED", pid=None, enabled=False, last_error="", last_event="Stopped by local hotkey")
-            except Exception as exc:
-                state.set_package(pkg, last_error=str(exc), last_event="Local stop failed")
-        if enabled_packages:
-            state.event(f"Stopped {len(enabled_packages)} enabled package(s)")
+    def stop_runtime() -> None:
+        state.event("Local stop requested")
+        stop_event.set()
 
-    dashboard = Dashboard(state, stop_event, reconnect_now, stop_enabled_packages) if interactive_tui else None
+    dashboard = Dashboard(state, stop_event, reconnect_now, stop_runtime) if interactive_tui else None
     if dashboard:
         dashboard.start()
 
@@ -324,22 +308,21 @@ def run_daemon(config: dict, local_api: bool, tui: bool | None = None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Roblox Auto-Rejoin Termux client")
-    parser.add_argument("--setup", action="store_true")
-    parser.add_argument("--daemon", action="store_true")
+    parser.add_argument("--setup", action="store_true", help="Open the legacy first-time setup menu")
+    parser.add_argument("--daemon", action="store_true", help="Start the runtime headlessly")
     parser.add_argument("--local-api", action="store_true")
     args = parser.parse_args()
 
-    config_was_missing = not CONFIG_PATH.exists()
     config = load_config()
-    paired = bool(config.get("server_url") and config.get("device_token") and config.get("device_id") and not config.get("needs_repair"))
-
+    paired = bool(
+        config.get("server_url")
+        and config.get("device_token")
+        and config.get("device_id")
+        and not config.get("needs_repair")
+    )
     first_time_setup = (not config.get("setup_completed", False)) and not config.get("device_token") and not config.get("device_id")
 
     if args.setup:
-        if not first_time_setup:
-            logging.basicConfig(level=logging.ERROR, format="[%(levelname)s] %(message)s")
-            logging.error("Setup is first-time only. Existing/partial credentials are never repaired through the setup menu.")
-            return
         SetupMenu(PROJECT_DIR, config, lambda: save_config(config)).run()
         return
 
@@ -347,20 +330,27 @@ def main() -> None:
         run_daemon(config, local_api=args.local_api, tui=False)
         return
 
-    if first_time_setup:
-        if tui_supported():
-            SetupMenu(PROJECT_DIR, config, lambda: save_config(config)).run()
+    # Interactive mode intentionally starts with a small menu. No dashboard is shown
+    # until the user explicitly selects Start.
+    if not tui_supported():
+        logging.basicConfig(level=logging.ERROR, format="[%(levelname)s] %(message)s")
+        if first_time_setup:
+            logging.error("Interactive setup requires a TTY. Run `python main.py` from Termux or `python main.py --setup`.")
+        elif not paired:
+            logging.error("Device is not paired. Run `python main.py --setup` or use an interactive Termux session.")
         else:
-            logging.basicConfig(level=logging.ERROR, format="[%(levelname)s] %(message)s")
-            logging.error("First-time setup requires a TTY. Run `python main.py --setup` from an interactive Termux session.")
+            logging.error("Interactive mode requires a TTY. Use `python main.py --daemon` for headless runtime.")
         return
 
-    if not paired:
-        # Existing but partial/broken config: NEVER auto-open setup. Daemon path stays headless and reports the issue.
-        run_daemon(config, local_api=args.local_api, tui=False)
-        return
+    setup_menu = SetupMenu(PROJECT_DIR, config, lambda: save_config(config))
 
-    run_daemon(config, local_api=args.local_api, tui=None)
+    def start_runtime() -> None:
+        run_daemon(config, local_api=args.local_api, tui=True)
+
+    def pairing_flow() -> None:
+        setup_menu.pair()
+
+    MainMenu(config, lambda: save_config(config), start_runtime, pairing_flow).run()
 
 
 if __name__ == "__main__":
