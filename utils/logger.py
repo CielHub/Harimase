@@ -9,6 +9,20 @@ import shutil
 from pathlib import Path
 
 
+class StateLogHandler(logging.Handler):
+    """Mirror formatted daemon logs into AgentState without touching terminal output."""
+
+    def __init__(self, state) -> None:
+        super().__init__()
+        self.state = state
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.state.append_log(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
 class _ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if not hasattr(record, "pkg"):
@@ -80,7 +94,7 @@ class GZipRotatingFileHandler(logging.Handler):
             super().close()
 
 
-def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> logging.Logger:
+def setup_logging(log_dir: str = "logs", level: int = logging.INFO, state=None, console_enabled: bool = True) -> logging.Logger:
     root = logging.getLogger()
     root.setLevel(level)
     if root.handlers:
@@ -92,10 +106,16 @@ def setup_logging(log_dir: str = "logs", level: int = logging.INFO) -> logging.L
     )
     context = _ContextFilter()
 
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-    console.addFilter(context)
-    root.addHandler(console)
+    if console_enabled:
+        console = logging.StreamHandler()
+        console.setFormatter(formatter)
+        console.addFilter(context)
+        root.addHandler(console)
+    elif state is not None:
+        state_handler = StateLogHandler(state)
+        state_handler.setFormatter(formatter)
+        state_handler.addFilter(context)
+        root.addHandler(state_handler)
 
     file_handler = GZipRotatingFileHandler(Path(log_dir) / "client.log")
     file_handler.setFormatter(formatter)
