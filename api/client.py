@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 
 from utils.crypto import sign_request
 
+FIXED_SERVER_URL = "http://nano-1.nura.host:5127"
+
 
 class AuthRequired(RuntimeError):
     """Raised when server credentials are rejected."""
@@ -46,8 +48,6 @@ def validate_server_url(value: str) -> tuple[str, bool]:
         raise ValueError("server_url must use a numeric port") from exc
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("server_url port must be between 1 and 65535")
-    if parsed.scheme == "http":
-        print("[WARN] Plain HTTP aktif. HMAC + token tetap melindungi request, tapi traffic tidak terenkripsi.")
     return normalized, parsed.scheme == "http"
 
 
@@ -56,7 +56,8 @@ class ServerClient:
 
     def __init__(self, config) -> None:
         self.config = config
-        self.base_url, self.insecure_transport = validate_server_url(config.get("server_url", ""))
+        self.config["server_url"] = FIXED_SERVER_URL
+        self.base_url, self.insecure_transport = validate_server_url(FIXED_SERVER_URL)
         self.token = str(config.get("device_token", ""))
         self.device_id = str(config.get("device_id", ""))
         self.timeout = max(3, min(int(config.get("server_timeout", 15)), 60))
