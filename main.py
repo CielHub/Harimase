@@ -19,6 +19,7 @@ from api.server import LocalApiServer
 from api.ws_client import WebSocketClient
 from core.command_handler import CommandHandler
 from core.crash_detector import CrashDetector
+from core.event_log import EventLogger, ErrorCode  # ✅ PHASE 2: Event logging
 from core.heartbeat import HeartbeatReporter
 from core.killer import PackageKiller
 from core.package_scanner import PackageScanner, valid_package_name
@@ -98,7 +99,12 @@ def run_daemon(config: dict, local_api: bool) -> None:
     scanner = PackageScanner(shell)
     monitor = ProcessMonitor(shell)
     killer = PackageKiller(shell, monitor)
-    rejoiner = Rejoiner(shell, monitor, killer, config, lambda: save_config(config), CONFIG_LOCK)
+    
+    # ✅ PHASE 2: Setup event logging
+    device_id = config.get("device_id", "unknown")
+    event_logger = EventLogger(device_id, logging.getLogger("events"))
+    
+    rejoiner = Rejoiner(shell, monitor, killer, config, lambda: save_config(config), CONFIG_LOCK, event_logger=event_logger)
     stop_event = threading.Event()
 
     if not config.get("server_url") or not config.get("device_token") or config.get("needs_repair"):
@@ -141,7 +147,7 @@ def run_daemon(config: dict, local_api: bool) -> None:
 
     adapter.info("Daemon started with %d configured packages", len(config.get("packages", [])))
     heartbeat_reporter = HeartbeatReporter(config, monitor, CONFIG_LOCK)
-    command_handler = CommandHandler(config, lambda: save_config(config), scanner, monitor, killer, rejoiner, adapter, CONFIG_LOCK)
+    command_handler = CommandHandler(config, lambda: save_config(config), scanner, monitor, killer, rejoiner, adapter, CONFIG_LOCK, event_logger=event_logger)
 
     def on_auth_failure(_exc):
         stop_event.set()
@@ -173,6 +179,12 @@ def run_daemon(config: dict, local_api: bool) -> None:
                 crash_detector.refresh()
             except Exception as exc:
                 adapter.warning("Crash log snapshot failed: %s", exc)
+                # ✅ PHASE 2: Log monitor error
+                event_logger.monitor_error(
+                    "system",
+                    ErrorCode.CRASH_DETECTION_FAILED,
+                    f"crash detector refresh failed: {exc}"
+                )
             with CONFIG_LOCK:
                 packages_to_check = [dict(item) for item in config.get("packages", []) if isinstance(item, dict)]
             for item in packages_to_check:
@@ -191,15 +203,33 @@ def run_daemon(config: dict, local_api: bool) -> None:
                     evidence = crash_detector.detect(pkg, snapshot, was_expected_running=True)
                     if evidence.confirmed:
                         package_log.warning("Crash confirmed: %s | %s", evidence.reason, ", ".join(evidence.indicators))
+                        
+                        # ✅ PHASE 2: Log crash detection event
+                        event_logger.crash_detected(
+                            pkg,
+                            evidence.reason,
+                            evidence.indicators or [],
+                            pid=snapshot.processes[0].pid if snapshot.processes else None
+                        )
+                        
                         ws_client.send_event_threadsafe("crash_detected", {"package": pkg, "reason": evidence.reason, "indicators": evidence.indicators})
                         result = rejoiner.rejoin(item, reason=evidence.reason)
                         if result.get("ok"):
                             start_times[pkg] = time.monotonic()
+                            # ✅ PHASE 2: Log rejoin success
+                            event_logger.rejoin_success(pkg, old_pid=None, new_pid=None)
                             ws_client.send_event_threadsafe("rejoin_success", {"package": pkg, "result": result, "automatic": True})
                         elif result.get("retry_exhausted") or result.get("critical"):
+                            # Error already logged in rejoiner, but we can add context
                             ws_client.send_event_threadsafe("rejoin_failed", {"package": pkg, "result": result, "automatic": True})
                 except Exception as exc:
                     package_log.exception("Monitor cycle failed: %s", exc)
+                    # ✅ PHASE 2: Log monitor error
+                    event_logger.monitor_error(
+                        pkg,
+                        ErrorCode.MONITOR_SNAPSHOT_FAILED,
+                        f"monitor cycle failed: {exc}"
+                    )
             stop_event.wait(3)
     finally:
         stop_event.set()
