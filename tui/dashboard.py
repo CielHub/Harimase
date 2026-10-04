@@ -102,12 +102,12 @@ class Dashboard:
         state: AgentState,
         stop_event: threading.Event,
         reconnect: Callable[[], None],
-        stop_packages: Callable[[], None],
+        stop_runtime: Callable[[], None],
     ) -> None:
         self.state = state
         self.stop_event = stop_event
         self.reconnect = reconnect
-        self.stop_packages = stop_packages
+        self.stop_runtime = stop_runtime
         self._thread: threading.Thread | None = None
         self._key_stop = threading.Event()
         self._action_lock = threading.Lock()
@@ -131,7 +131,7 @@ class Dashboard:
                     self._render(self.state.snapshot()),
                     refresh_per_second=1,
                     transient=False,
-                    screen=True,
+                    screen=False,
                     redirect_stdout=False,
                     redirect_stderr=False,
                 ) as live:
@@ -174,8 +174,8 @@ class Dashboard:
             self.state.event(f"Local hotkey: logs {'ON' if visible else 'OFF'}")
             return
         if key == "s":
-            self.state.event("Local hotkey: stopping enabled packages")
-            self._spawn_action(self.stop_packages, "stop-packages")
+            self.state.event("Local hotkey: stopping runtime")
+            self._spawn_action(self.stop_runtime, "stop-runtime")
 
     def _spawn_action(self, callback: Callable[[], None], name: str) -> None:
         if not self._action_lock.acquire(blocking=False):
@@ -194,79 +194,51 @@ class Dashboard:
 
     def _render(self, snapshot: dict) -> "Group":
         width = max(40, self._terminal_width())
-        root = Layout(name="root")
-        root.split_column(
-            Layout(self._header(snapshot, width), name="header", size=7),
-            Layout(self._packages(snapshot, width), name="packages", ratio=3),
-            Layout(self._footer(snapshot, width), name="footer", size=3),
-        )
-        if snapshot.get("show_logs"):
-            root["packages"].split_column(
-                Layout(self._packages(snapshot, width), name="table", ratio=2),
-                Layout(self._logs(snapshot, width), name="logs", ratio=1),
-            )
-        return root
-
-    def _header(self, snapshot: dict, width: int):
         connection = str(snapshot.get("connection", "UNKNOWN"))
         marker = CONNECTION_MARKERS.get(connection, "?")
         hb = _age(snapshot.get("last_heartbeat", 0.0))
-        title = Text("ROBLOX AUTO-REJOIN", style="bold")
-        meta = Table.grid(padding=(0, 1))
-        meta.add_column(no_wrap=True)
-        meta.add_column(ratio=1)
-        meta.add_row("Device", _clip(snapshot.get("device_name", "-"), max(12, width - 24)))
-        meta.add_row("WS", f"{marker} {connection}   hb {hb}   uptime {_fmt_uptime(snapshot.get('uptime_sec', 0))}")
-        meta.add_row("Server", _clip(snapshot.get("server_url", "-"), max(18, width - 24)))
-        return Panel(Group(title, meta), border_style="bright_black", padding=(0, 1))
+        packages = snapshot.get("packages", [])
+
+        header = Text(
+            f"HARIMASE  {marker} {connection}   "
+            f"Device: {_clip(snapshot.get('device_name', '-'), 22)}   "
+            f"HB: {hb}   Uptime: {_fmt_uptime(snapshot.get('uptime_sec', 0))}",
+            style="bold",
+        )
+        server = Text(f"Server: {_clip(snapshot.get('server_url', '-'), max(20, width - 8))}")
+
+        if snapshot.get("show_logs"):
+            body = self._logs(snapshot, width)
+            footer = Text("[l] dashboard  [r] reconnect  [q] quit")
+            return Group(header, server, body, footer)
+
+        body_lines = []
+        for index, item in enumerate(packages[:10], 1):
+            alias = _clip(item.get("alias") or item.get("package") or "-", max(12, min(30, width - 24)))
+            state = str(item.get("state", "IDLE"))[:12]
+            pid = str(item.get("pid") or "-")
+            body_lines.append(f"{index:>2}. {alias:<30} {state:<12} {pid:>7}")
+        if not body_lines:
+            body_lines.append("--  no packages configured")
+        package_text = Text("\n".join(body_lines))
+        package_count = Text(f"Packages: {len(packages)}   Watchdog: RUNNING")
+        last_event = Text(f"Last: {_clip(snapshot.get('last_event', '-'), max(24, width - 7))}")
+        footer = Text("[r] reconnect  [l] logs  [s] stop  [q] quit")
+        return Group(header, server, package_count, package_text, last_event, footer)
 
     def _packages(self, snapshot: dict, width: int):
-        table = Table(
-            expand=True,
-            show_header=True,
-            header_style="bold",
-            box=None,
-            padding=(0, 1),
-            collapse_padding=True,
-        )
-        table.add_column("#", width=3, justify="right", no_wrap=True)
-        table.add_column("PACKAGE", ratio=3, no_wrap=True)
-        table.add_column("STATE", width=13, no_wrap=True)
-        table.add_column("PID", width=7, justify="right", no_wrap=True)
-        table.add_column("ERR", ratio=2, no_wrap=True)
         packages = snapshot.get("packages", [])
-        if not packages:
-            table.add_row("-", "no packages configured", "IDLE", "-", "")
-            return Panel(table, title=f"PACKAGES ({len(packages)})", border_style="bright_black", padding=(0, 0))
-        alias_width = max(12, min(24, width - 39))
-        for index, item in enumerate(packages, 1):
-            state = str(item.get("state", "IDLE"))
-            err = _clip(item.get("last_error", "") or "", max(8, width // 3))
-            pid = str(item.get("pid") or "-")
-            if item.get("recovery_count"):
-                err = _clip(f"R{item['recovery_count']} {err}".strip(), max(8, width // 3))
-            table.add_row(
-                str(index),
-                _clip(item.get("alias") or item.get("package") or "-", alias_width),
-                state,
-                pid,
-                err,
-            )
-        return Panel(table, title=f"PACKAGES ({len(packages)})", border_style="bright_black", padding=(0, 0))
+        lines = []
+        for index, item in enumerate(packages[:10], 1):
+            lines.append(f"{index:>2}. {_clip(item.get('alias') or item.get('package') or '-', max(12, width - 8))}")
+        return Text("\n".join(lines) or "--  no packages configured")
 
     def _logs(self, snapshot: dict, width: int):
-        logs = snapshot.get("logs", [])[-8:]
-        text = Text("\n".join(_clip(line, max(20, width - 4)) for line in logs) or "No log events yet.")
-        return Panel(text, title="LOG", border_style="bright_black", padding=(0, 1))
+        logs = snapshot.get("logs", [])[-10:]
+        return Text("\n".join(_clip(line, max(20, width - 2)) for line in logs) or "--  no log events yet")
 
     def _footer(self, snapshot: dict, width: int):
-        event = _clip(snapshot.get("last_event", "-"), max(20, width - 34))
-        hotkeys = "q quit  r reconnect  l logs  s stop"
-        row = Table.grid(expand=True)
-        row.add_column(ratio=1)
-        row.add_column(justify="right", no_wrap=True)
-        row.add_row(event, hotkeys)
-        return Panel(row, border_style="bright_black", padding=(0, 1))
+        return Text("[r] reconnect  [l] logs  [s] stop  [q] quit")
 
     @staticmethod
     def _terminal_width() -> int:
