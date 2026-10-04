@@ -7,8 +7,10 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from typing import Optional
 
 from core.killer import PackageKiller
+from core.event_log import EventLogger, ErrorCode  # ✅ PHASE 2: Event logging
 from core.package_scanner import valid_package_name
 from core.process_monitor import ProcessMonitor
 from utils.shell import Shell
@@ -22,13 +24,14 @@ class RetryState:
 
 
 class Rejoiner:
-    def __init__(self, shell: Shell, monitor: ProcessMonitor, killer: PackageKiller, config, save_config, config_lock=None) -> None:
+    def __init__(self, shell: Shell, monitor: ProcessMonitor, killer: PackageKiller, config, save_config, config_lock=None, event_logger: Optional[EventLogger] = None) -> None:
         self.shell = shell
         self.monitor = monitor
         self.killer = killer
         self.config = config
         self.save_config = save_config
         self.config_lock = config_lock
+        self.event_logger = event_logger  # ✅ PHASE 2: Event logging
         self.states: dict[str, RetryState] = defaultdict(lambda: RetryState(deque()))
         self._lock = threading.RLock()
         self._load_state()
@@ -59,13 +62,56 @@ class Rejoiner:
             state = self.states[package]
             now = time.time()
             self._prune(state, now)
+            
+            # ✅ PHASE 2: Grace period block with error code
             if now < state.grace_until and reason.startswith("verified"):
-                return {"ok": False, "reason": "launch grace active", "throttled": True}
+                grace_remaining = max(1, int(state.grace_until - now))
+                if self.event_logger:
+                    self.event_logger.rejoin_failed(
+                        package,
+                        ErrorCode.REJOIN_BLOCKED_GRACE,
+                        f"grace period active for {grace_remaining}s",
+                        {"remaining_seconds": grace_remaining}
+                    )
+                return {
+                    "ok": False,
+                    "reason": "launch grace active",
+                    "throttled": True,
+                    "error_code": ErrorCode.REJOIN_BLOCKED_GRACE.value  # ✅ PHASE 2
+                }
+            
+            # ✅ PHASE 2: Cooldown block with error code
             if now - state.last_rejoin < cooldown:
                 remaining = max(1, int(cooldown - (now - state.last_rejoin)))
-                return {"ok": False, "reason": f"cooldown active for {remaining}s", "throttled": True}
+                if self.event_logger:
+                    self.event_logger.rejoin_failed(
+                        package,
+                        ErrorCode.REJOIN_BLOCKED_COOLDOWN,
+                        f"cooldown active for {remaining}s",
+                        {"remaining_seconds": remaining}
+                    )
+                return {
+                    "ok": False,
+                    "reason": f"cooldown active for {remaining}s",
+                    "throttled": True,
+                    "error_code": ErrorCode.REJOIN_BLOCKED_COOLDOWN.value  # ✅ PHASE 2
+                }
+            
+            # ✅ PHASE 2: Retry limit block with error code
             if len(state.history) >= max_retry:
-                return {"ok": False, "reason": "max retry per 30 minutes reached", "retry_exhausted": True}
+                if self.event_logger:
+                    self.event_logger.rejoin_failed(
+                        package,
+                        ErrorCode.REJOIN_BLOCKED_RETRY_LIMIT,
+                        "max retry per 30 minutes reached",
+                        {"retry_count": len(state.history), "max_retry": max_retry}
+                    )
+                return {
+                    "ok": False,
+                    "reason": "max retry per 30 minutes reached",
+                    "retry_exhausted": True,
+                    "error_code": ErrorCode.REJOIN_BLOCKED_RETRY_LIMIT.value  # ✅ PHASE 2
+                }
 
             # Reserve the retry slot before any external process action so two threads cannot race.
             state.history.append(now)
@@ -77,7 +123,21 @@ class Rejoiner:
             try:
                 kill_mode = self.killer.stop(package, cached=cached)
             except Exception as exc:
-                return {"ok": False, "reason": str(exc), "critical": True}
+                # ✅ PHASE 2: Map exception to error code
+                error_code = self._map_killer_exception(exc)
+                if self.event_logger:
+                    self.event_logger.killer_error(
+                        package,
+                        error_code,
+                        str(exc),
+                        pid=cached[0].pid if cached else None
+                    )
+                return {
+                    "ok": False,
+                    "reason": str(exc),
+                    "critical": True,
+                    "error_code": error_code.value  # ✅ PHASE 2
+                }
 
             time.sleep(3)
             if mode == "executor_only":
@@ -91,10 +151,32 @@ class Rejoiner:
                 )
 
             if not launch.ok:
-                return {"ok": False, "reason": launch.stderr or launch.stdout or "launch failed", "critical": True}
+                # ✅ PHASE 2: Launch error with error code
+                error_code = ErrorCode.REJOIN_LAUNCH_FAILED
+                if self.event_logger:
+                    self.event_logger.rejoin_failed(
+                        package,
+                        error_code,
+                        launch.stderr or launch.stdout or "launch failed"
+                    )
+                return {
+                    "ok": False,
+                    "reason": launch.stderr or launch.stdout or "launch failed",
+                    "critical": True,
+                    "error_code": error_code.value  # ✅ PHASE 2
+                }
 
             state.grace_until = time.time() + max(10, min(int(self.config.get("boot_grace_sec", 10)), 60))
             self._persist_state()
+            
+            # ✅ PHASE 2: Log rejoin success
+            if self.event_logger:
+                self.event_logger.rejoin_success(
+                    package,
+                    old_pid=cached[0].pid if cached else None,
+                    new_pid=None  # Will be determined by monitor next cycle
+                )
+            
             return {"ok": True, "reason": reason, "kill": kill_mode, "launch": launch.stdout[-500:]}
 
     def grace_active(self, package: str) -> bool:
@@ -146,3 +228,27 @@ class Rejoiner:
         else:
             with self.config_lock:
                 persist()
+
+    def _map_killer_exception(self, exc: Exception) -> ErrorCode:
+        """Map exception to standard ErrorCode for consistent error handling.
+        
+        Args:
+            exc: Exception from killer.stop()
+            
+        Returns:
+            ErrorCode enum matching the exception
+        """
+        msg = str(exc)
+        
+        # Check for specific error conditions
+        if "UID could not be verified" in msg or "uid not found" in msg.lower():
+            return ErrorCode.UID_NOT_FOUND
+        elif "kill -9 failed" in msg or "failed to kill" in msg.lower():
+            return ErrorCode.KILL_FAILED
+        elif "PID verification" in msg or "verify" in msg.lower() and "failed" in msg.lower():
+            return ErrorCode.PID_VERIFICATION_FAILED
+        elif "survived kill" in msg or "survived kill -9" in msg.lower():
+            return ErrorCode.PID_SURVIVED_KILL
+        else:
+            # Default to generic kill error
+            return ErrorCode.KILL_FAILED
