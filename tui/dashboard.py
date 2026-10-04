@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - exercised only on minimal installs
 
 CONNECTION_MARKERS = {
     "CONNECTED": "●",
+    "READY": "●",
     "CONNECTING": "○",
     "AUTHENTICATING": "◌",
     "RECONNECTING": "↻",
