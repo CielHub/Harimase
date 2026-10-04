@@ -102,22 +102,67 @@ class CommandHandler:
                 if changed:
                     self.save_config()
             return {"ok": changed, "package": pkg}
-        if command_type in {"start", "stop", "package_set_enabled"}:
+        if command_type in {"start", "stop", "package_set_enabled", "start_afk"}:
             pkg = str(payload.get("package", "")).strip()
             if not valid_package_name(pkg):
                 return {"ok": False, "reason": "invalid package name"}
-            enabled = bool(payload.get("enabled")) if command_type == "package_set_enabled" else command_type == "start"
-            changed = False
+            package_cfg = self._package(pkg)
+            enabled = bool(payload.get("enabled")) if command_type == "package_set_enabled" else command_type != "stop"
+
+            if command_type == "start_afk":
+                join = payload.get("join") if isinstance(payload.get("join"), dict) else {}
+                method = str(join.get("method") or "").strip()
+                if method == "place_id":
+                    package_cfg.update({
+                        "join_method": "place_id",
+                        "mode": "deep_link",
+                        "place_id": str(join.get("place_id") or "").strip(),
+                        "job_id": str(join.get("job_id") or "").strip(),
+                        "deep_link": "",
+                    })
+                elif method == "deep_link":
+                    package_cfg.update({
+                        "join_method": "deep_link",
+                        "mode": "deep_link",
+                        "deep_link": str(join.get("deep_link") or "").strip(),
+                        "place_id": "",
+                        "job_id": "",
+                    })
+                else:
+                    return {"ok": False, "reason": "unsupported join method"}
+
+            try:
+                snapshot = self.monitor.snapshot(pkg)
+            except Exception as exc:
+                return {"ok": False, "reason": f"unable to inspect package: {exc}"}
+
+            if enabled:
+                if snapshot.running:
+                    result = {"ok": True, "package": pkg, "enabled": True, "already_running": True}
+                else:
+                    result = self.rejoiner.rejoin(package_cfg, reason="remote AFK start" if command_type == "start_afk" else "remote start")
+                    if not result.get("ok"):
+                        return {"ok": False, "package": pkg, "enabled": False, "reason": result.get("reason", "start failed"), "throttled": result.get("throttled", False), "retry_exhausted": result.get("retry_exhausted", False)}
+                    result = {**result, "package": pkg, "enabled": True}
+            else:
+                try:
+                    kill_result = self.killer.stop(pkg, cached=self.monitor.cached_processes(pkg))
+                except Exception as exc:
+                    return {"ok": False, "package": pkg, "enabled": True, "reason": f"stop failed: {exc}"}
+                result = {"ok": True, "package": pkg, "enabled": False, "stopped": kill_result}
+
             with self.config_lock if self.config_lock is not None else _NullLock():
-                for item in self.config.get("packages", []):
+                for index, item in enumerate(self.config.get("packages", [])):
                     if item.get("package") == pkg:
-                        item["enabled"] = enabled
-                        item["status"] = "active" if enabled else "stopped"
-                        changed = True
+                        updated = dict(item)
+                        if command_type == "start_afk":
+                            updated.update({k: v for k, v in package_cfg.items() if k in {"join_method", "place_id", "job_id", "deep_link"}})
+                        updated["enabled"] = enabled
+                        updated["status"] = "active" if enabled else "stopped"
+                        self.config["packages"][index] = updated
+                        self.save_config()
                         break
-                if changed:
-                    self.save_config()
-            return {"ok": changed, "package": pkg, "enabled": enabled}
+            return result
         return {"ok": False, "reason": f"unknown command type: {command_type}"}
 
     def _package(self, package: str) -> dict:

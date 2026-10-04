@@ -45,15 +45,24 @@ class Rejoiner:
             return {"ok": False, "reason": "invalid retry configuration"}
 
         mode = str(package_cfg.get("mode", "deep_link"))
+        join_method = str(package_cfg.get("join_method") or ("place_id" if package_cfg.get("place_id") else "deep_link"))
         place_id = str(package_cfg.get("place_id", "")).strip()
         job_id = str(package_cfg.get("job_id", "")).strip()
+        deep_link = str(package_cfg.get("deep_link", "")).strip()
         if mode not in {"deep_link", "executor_only"}:
             return {"ok": False, "reason": "unsupported mode"}
-        if mode == "deep_link":
+        if mode == "deep_link" and join_method == "place_id":
             if not place_id or len(place_id) > 32 or not place_id.isdigit():
                 return {"ok": False, "reason": "place_id must be numeric and <=32 characters"}
             if len(job_id) > 256 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in job_id):
                 return {"ok": False, "reason": "job_id contains unsupported characters"}
+        elif mode == "deep_link" and join_method == "deep_link":
+            if not self._valid_deep_link(deep_link):
+                return {"ok": False, "reason": "invalid deep_link; use roblox:// or https://www.roblox.com/"}
+        elif mode == "executor_only":
+            pass
+        else:
+            return {"ok": False, "reason": "unsupported join method"}
 
         with self._lock:
             state = self.states[package]
@@ -83,9 +92,12 @@ class Rejoiner:
             if mode == "executor_only":
                 launch = self._launch_executor(package)
             else:
-                uri = f"roblox://experiences/start?placeId={place_id}"
-                if job_id:
-                    uri += f"&gameInstanceId={job_id}"
+                if join_method == "deep_link":
+                    uri = deep_link
+                else:
+                    uri = f"roblox://experiences/start?placeId={place_id}"
+                    if job_id:
+                        uri += f"&gameInstanceId={job_id}"
                 launch = self.shell.run(
                     f"am start -W -a android.intent.action.VIEW -d {shlex.quote(uri)}", timeout=20
                 )
@@ -100,6 +112,17 @@ class Rejoiner:
     def grace_active(self, package: str) -> bool:
         with self._lock:
             return time.time() < self.states[package].grace_until
+
+    @staticmethod
+    def _valid_deep_link(value: str) -> bool:
+        if not value or len(value) > 2048 or any(ord(char) < 32 for char in value):
+            return False
+        from urllib.parse import urlparse
+
+        parsed = urlparse(value)
+        if parsed.scheme == "roblox":
+            return bool(parsed.netloc or parsed.path)
+        return parsed.scheme == "https" and bool(parsed.hostname) and parsed.hostname.lower() in {"roblox.com", "www.roblox.com"}
 
     def _launch_executor(self, package: str):
         resolved = self.shell.run(f"cmd package resolve-activity --brief {shlex.quote(package)}", timeout=8)
