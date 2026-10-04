@@ -1,14 +1,14 @@
 {
   "device_name": "HP-Android10-01",
   "device_uuid": "",
-  "server_url": "https://bot.example.com",
+  "server_url": "http://nano-1.nura.host:5127",
   "device_token": "",
   "device_id": "",
-  "poll_interval": 5,
   "heartbeat_interval": 30,
   "server_timeout": 15,
   "boot_grace_sec": 10,
   "packages": [],
+  "setup_completed": false,
   "runtime": {
     "retry_history": {},
     "last_rejoin": {}
