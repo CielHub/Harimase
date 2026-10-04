@@ -165,17 +165,41 @@ def run_daemon(config: dict, local_api: bool, tui: bool | None = None) -> None:
     heartbeat_reporter = HeartbeatReporter(config, monitor, CONFIG_LOCK)
     command_handler = CommandHandler(config, lambda: save_config(config), scanner, monitor, killer, rejoiner, adapter, CONFIG_LOCK)
 
+    def auto_sync_package_inventory() -> dict:
+        """Scan Android packages after every successful WS READY and return sync payload."""
+        adapter.info("[PACKAGE_SCAN] automatic scan started")
+        try:
+            candidates = scanner.scan()
+            with CONFIG_LOCK:
+                before = {item.get("package") for item in config.get("packages", []) if isinstance(item, dict) and item.get("package")}
+                config["packages"] = scanner.merge_manual(candidates, config.get("packages", []))
+                save_config(config)
+                state.sync_packages(config.get("packages", []))
+            added = [candidate.package for candidate in candidates if candidate.package not in before]
+            adapter.info("[PACKAGE_SCAN] automatic scan complete detected=%d new=%d", len(candidates), len(added))
+            return {
+                "packages": [
+                    {"package": candidate.package, "score": candidate.score, "reasons": candidate.reasons}
+                    for candidate in candidates
+                ],
+                "scan_ts": time.time(),
+            }
+        except Exception:
+            adapter.exception("[PACKAGE_SCAN] automatic scan failed; preserving existing configuration")
+            return {}
+
     def on_auth_failure(exc):
         state.set_connection("AUTH_FAILED", note=f"Authentication rejected: {exc}")
         stop_event.set()
 
     def on_ws_state(connection_state: str, **info) -> None:
+        display_state = "CONNECTED" if connection_state == "READY" else connection_state
         state.set_connection(
-            connection_state,
+            display_state,
             note=str(info.get("note", "")),
             reconnect_count=info.get("reconnect_count"),
         )
-        if connection_state == "CONNECTED":
+        if connection_state in {"CONNECTED", "READY"}:
             state.mark_heartbeat()
 
     ws_client = WebSocketClient(
@@ -188,6 +212,7 @@ def run_daemon(config: dict, local_api: bool, tui: bool | None = None) -> None:
         logger=logging.getLogger("ws-client"),
         config_lock=CONFIG_LOCK,
         on_state_change=on_ws_state,
+        on_session_ready=auto_sync_package_inventory,
     )
     ws_client.start()
 
