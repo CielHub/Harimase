@@ -102,11 +102,11 @@ class CommandHandler:
                 if changed:
                     self.save_config()
             return {"ok": changed, "package": pkg}
-        if command_type in {"start", "stop"}:
+        if command_type in {"start", "stop", "package_set_enabled"}:
             pkg = str(payload.get("package", "")).strip()
             if not valid_package_name(pkg):
                 return {"ok": False, "reason": "invalid package name"}
-            enabled = command_type == "start"
+            enabled = bool(payload.get("enabled")) if command_type == "package_set_enabled" else command_type == "start"
             changed = False
             with self.config_lock if self.config_lock is not None else _NullLock():
                 for item in self.config.get("packages", []):
