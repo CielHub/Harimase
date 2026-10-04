@@ -7,14 +7,12 @@ import logging
 import time
 from pathlib import Path
 from collections import deque
-from typing import Optional
 
-from core.event_log import EventLogger, ErrorCode  # ✅ PHASE 2: Event logging
 from core.package_scanner import valid_package_name
 
 
 class CommandHandler:
-    def __init__(self, config: dict, save_config, scanner, monitor, killer, rejoiner, logger: logging.LoggerAdapter, config_lock=None, event_logger: Optional[EventLogger] = None) -> None:
+    def __init__(self, config: dict, save_config, scanner, monitor, killer, rejoiner, logger: logging.LoggerAdapter, config_lock=None) -> None:
         self.config = config
         self.save_config = save_config
         self.scanner = scanner
@@ -23,7 +21,6 @@ class CommandHandler:
         self.rejoiner = rejoiner
         self.logger = logger
         self.config_lock = config_lock
-        self.event_logger = event_logger  # ✅ PHASE 2: Event logging
 
     def execute(self, command: dict) -> dict:
         command_id = str(command.get("id", "")).strip()
@@ -39,27 +36,7 @@ class CommandHandler:
             return {"status": status, "result": result_text, "events": events}
         except Exception as exc:
             self.logger.exception("Command %s failed: %s", command_id, exc)
-            
-            # ✅ PHASE 2: Map exception to error code
-            error_code = self._map_command_exception(exc)
-            
-            # ✅ PHASE 2: Log command error if event logger available
-            if self.event_logger:
-                self.event_logger.command_error(
-                    "system",
-                    error_code,
-                    str(exc)
-                )
-            
-            return {
-                "status": "failed",
-                "result": json.dumps({
-                    "ok": False,
-                    "reason": str(exc),
-                    "error_code": error_code.value  # ✅ PHASE 2
-                })[:8_000],
-                "events": []
-            }
+            return {"status": "failed", "result": json.dumps({"ok": False, "reason": str(exc)})[:8_000], "events": []}
 
     def _dispatch(self, command_type: str, payload: dict) -> dict:
         if command_type == "ping":
@@ -149,26 +126,6 @@ class CommandHandler:
             if item.get("package") == package:
                 return dict(item)
         raise KeyError(f"package not configured: {package}")
-
-    def _map_command_exception(self, exc: Exception) -> ErrorCode:
-        """Map exception to standard ErrorCode for consistent error handling.
-        
-        Args:
-            exc: Exception from command execution
-            
-        Returns:
-            ErrorCode enum matching the exception
-        """
-        msg = str(exc)
-        
-        # Check for specific conditions
-        if "timeout" in msg.lower():
-            return ErrorCode.COMMAND_TIMEOUT
-        elif "invalid package" in msg.lower():
-            return ErrorCode.INVALID_PACKAGE
-        else:
-            # Default to generic command failed
-            return ErrorCode.COMMAND_FAILED
 
 
 class _NullLock:
